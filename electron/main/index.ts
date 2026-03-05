@@ -1,4 +1,4 @@
-import { app, BrowserWindow, shell, ipcMain, dialog } from 'electron'
+import { app, BrowserWindow, shell, ipcMain, dialog, nativeImage } from 'electron'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
 import { PDFDocument } from 'pdf-lib'
 import * as XLSX from 'xlsx'
+import { translations, type SupportedLanguage } from '../../src/i18n/translations'
 import { update } from './update'
 
 const require = createRequire(import.meta.url)
@@ -72,6 +73,25 @@ const supportedOrganizerExtensions = new Set([
   'heif',
 ])
 
+function getMainLanguage(): SupportedLanguage {
+  const locale = app.getLocale()
+  if (locale.startsWith('pt')) return 'pt-BR'
+  if (locale.startsWith('es')) return 'es'
+  return 'en'
+}
+
+function getByPath(source: unknown, pathKey: string): string | undefined {
+  const result = pathKey
+    .split('.')
+    .reduce<unknown>((acc, key) => (acc && typeof acc === 'object' ? (acc as Record<string, unknown>)[key] : undefined), source)
+  return typeof result === 'string' ? result : undefined
+}
+
+function tm(key: string) {
+  const language = getMainLanguage()
+  return getByPath(translations[language] ?? translations.en, key) ?? key
+}
+
 function formatWithPattern(input: { pattern: string; originalName: string; seq: number }) {
   const date = new Date().toISOString().slice(0, 10)
   const seq = String(input.seq).padStart(3, '0')
@@ -111,6 +131,69 @@ async function collectFilesByExtension(inputPaths: string[], extensions: string[
   return allFiles
     .filter((filePath) => extensionSet.has(path.extname(filePath).replace('.', '').toLowerCase()))
     .sort((a, b) => a.localeCompare(b))
+}
+
+async function rasterizeImageToPng(imagePath: string, bytes: Buffer) {
+  const ext = path.extname(imagePath).replace('.', '').toLowerCase()
+  const mimeType = mimeByExtension[ext]
+  if (!mimeType) {
+    throw new Error(`${tm('organizer.errors.unsupportedImageForPdf')} ${path.basename(imagePath)}`)
+  }
+
+  const dataUrl = `data:${mimeType};base64,${bytes.toString('base64')}`
+  const directImage = nativeImage.createFromDataURL(dataUrl)
+  if (!directImage.isEmpty()) return directImage.toPNG()
+
+  const rasterWindow = new BrowserWindow({
+    show: false,
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+    },
+  })
+
+  try {
+    await rasterWindow.loadURL('data:text/html,<html><body style="margin:0;background:transparent"></body></html>')
+    const rasterizedDataUrl = await rasterWindow.webContents.executeJavaScript(`
+      new Promise((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => {
+          const canvas = document.createElement('canvas')
+          canvas.width = img.naturalWidth || img.width
+          canvas.height = img.naturalHeight || img.height
+          const context = canvas.getContext('2d')
+          if (!context) {
+            reject(new Error(${JSON.stringify(tm('common.unknownError'))}))
+            return
+          }
+          context.drawImage(img, 0, 0)
+          resolve(canvas.toDataURL('image/png'))
+        }
+        img.onerror = () => reject(new Error(${JSON.stringify(tm('common.unknownError'))}))
+        img.src = ${JSON.stringify(dataUrl)}
+      })
+    `, true) as string
+
+    const rasterizedImage = nativeImage.createFromDataURL(rasterizedDataUrl)
+    if (rasterizedImage.isEmpty()) {
+      throw new Error(`${tm('organizer.errors.couldNotRasterizeImage')} ${path.basename(imagePath)}`)
+    }
+
+    return rasterizedImage.toPNG()
+  } finally {
+    rasterWindow.destroy()
+  }
+}
+
+async function embedImageForPdf(pdf: PDFDocument, imagePath: string) {
+  const ext = path.extname(imagePath).replace('.', '').toLowerCase()
+  const bytes = await readFile(imagePath)
+
+  if (ext === 'png') return pdf.embedPng(bytes)
+  if (ext === 'jpg' || ext === 'jpeg') return pdf.embedJpg(bytes)
+
+  const rasterizedPng = await rasterizeImageToPng(imagePath, bytes)
+  return pdf.embedPng(rasterizedPng)
 }
 
 async function ensureUniquePath(targetPath: string) {
@@ -173,13 +256,13 @@ function emitJobResult(payload: { id: string; outputPath: string; totalFiles: nu
 function normalizeError(error: unknown) {
   if (error instanceof Error) {
     return {
-      message: error.message || 'Unknown error',
-      detail: error.stack || error.message || 'No stack available',
+      message: error.message || tm('common.unknownError'),
+      detail: error.stack || error.message || tm('common.noStack'),
     }
   }
   return {
-    message: String(error || 'Unknown error'),
-    detail: String(error || 'Unknown error'),
+    message: String(error || tm('common.unknownError')),
+    detail: String(error || tm('common.unknownError')),
   }
 }
 
@@ -485,7 +568,7 @@ async function runImagesToPdf(params: {
   const allFiles = await collectFiles(params.paths)
   const compatibleImages = allFiles.filter((filePath) => {
     const ext = path.extname(filePath).replace('.', '').toLowerCase()
-    return ext === 'jpg' || ext === 'jpeg' || ext === 'png'
+    return ext === 'jpg' || ext === 'jpeg' || ext === 'png' || ext === 'webp'
   })
   const totalFiles = compatibleImages.length
 
@@ -499,17 +582,13 @@ async function runImagesToPdf(params: {
       status: 'error',
       createdAt: params.createdAt,
     })
-    throw new Error('Nenhuma imagem compativel encontrada. Use JPG, JPEG ou PNG.')
+    throw new Error(tm('organizer.errors.noCompatibleImages'))
   }
 
   const outPdf = await PDFDocument.create()
   for (let index = 0; index < compatibleImages.length; index += 1) {
     const imagePath = compatibleImages[index]
-    const ext = path.extname(imagePath).replace('.', '').toLowerCase()
-    const bytes = await readFile(imagePath)
-    const image = ext === 'png'
-      ? await outPdf.embedPng(bytes)
-      : await outPdf.embedJpg(bytes)
+    const image = await embedImageForPdf(outPdf, imagePath)
 
     const page = outPdf.addPage([image.width, image.height])
     page.drawImage(image, {
@@ -638,7 +717,7 @@ ipcMain.handle('toolkit:pick-paths', async () => {
 
   const result = await dialog.showOpenDialog(win, {
     properties: ['openFile', 'openDirectory', 'multiSelections'],
-    title: 'Select files or folders',
+    title: tm('organizer.dialogs.selectFilesOrFolders'),
   })
 
   return result.canceled ? [] : result.filePaths
@@ -822,10 +901,23 @@ ipcMain.handle('toolkit:get-image-preview', async (_, targetPath: string) => {
   }
 })
 
+ipcMain.handle('toolkit:get-pdf-preview', async (_, targetPath: string) => {
+  try {
+    const thumbnail = await nativeImage.createThumbnailFromPath(targetPath, {
+      width: 256,
+      height: 256,
+    })
+
+    return thumbnail.isEmpty() ? null : thumbnail.toDataURL()
+  } catch {
+    return null
+  }
+})
+
 ipcMain.handle('toolkit:get-pdf-buffer', async (_, targetPath: string) => {
   try {
     const fileBuffer = await readFile(targetPath)
-    return fileBuffer.toString('base64')
+    return Uint8Array.from(fileBuffer)
   } catch {
     return null
   }
@@ -837,7 +929,7 @@ ipcMain.handle('toolkit:organizer-pick-folder', async () => {
   if (!win) return null
   const result = await dialog.showOpenDialog(win, {
     properties: ['openDirectory'],
-    title: 'Select folder',
+    title: tm('organizer.dialogs.selectFolder'),
   })
   if (result.canceled || result.filePaths.length === 0) return null
   return result.filePaths[0]
@@ -906,5 +998,5 @@ ipcMain.handle('toolkit:organizer-move-paths', async (_, payload: { sourcePaths:
 
 ipcMain.handle('toolkit:organizer-delete-paths', async (_, payload: { paths: string[] }) => {
   console.warn('[toolkit] delete blocked by safety policy', payload.paths)
-  throw new Error('Delete is disabled by safety policy. This app does not remove user files.')
+  throw new Error(tm('organizer.errors.deleteDisabled'))
 })

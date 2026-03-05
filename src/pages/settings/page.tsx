@@ -54,9 +54,9 @@ export function SettingsPage() {
             value={settings.language}
             onChange={handleLanguageChange}
           >
-            <option value='pt-BR'>Portugues (Brasil)</option>
-            <option value='en'>English</option>
-            <option value='es'>Espanol</option>
+            <option value='pt-BR'>{t('settings.languages.ptBR')}</option>
+            <option value='en'>{t('settings.languages.en')}</option>
+            <option value='es'>{t('settings.languages.es')}</option>
           </select>
         </label>
       </Card>

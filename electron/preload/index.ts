@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('toolkit', {
     ipcRenderer.invoke('toolkit:start-job', payload),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   getImagePreview: (targetPath: string) => ipcRenderer.invoke('toolkit:get-image-preview', targetPath),
+  getPdfPreview: (targetPath: string) => ipcRenderer.invoke('toolkit:get-pdf-preview', targetPath),
   getPdfBuffer: (targetPath: string) => ipcRenderer.invoke('toolkit:get-pdf-buffer', targetPath),
   revealInFolder: (targetPath: string) => ipcRenderer.invoke('toolkit:reveal-in-folder', targetPath),
   startNativeDrag: (paths: string[]) => ipcRenderer.send('toolkit:start-native-drag', { paths }),
