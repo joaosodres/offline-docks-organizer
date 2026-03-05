@@ -1,5 +1,5 @@
-import { DragEvent, useEffect, useMemo, useRef, useState } from 'react'
-import { FolderOpen, PanelLeft, Play, RefreshCw } from 'lucide-react'
+import { DragEvent, KeyboardEvent, MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { File, FileImage, FileText, Folder, FolderOpen, PanelLeft, Play, RefreshCw } from 'lucide-react'
 import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist'
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url'
 import { Button } from '@/components/ui/button'
@@ -32,6 +32,17 @@ type DirectoryListing = {
   files: FileNode[]
 }
 
+type ContextMenuState = {
+  node: ExplorerNode
+  x: number
+  y: number
+}
+
+type RenameInlineState = {
+  path: string
+  value: string
+}
+
 const imageExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'heic', 'heif'])
 const pdfExtensions = new Set(['pdf'])
 GlobalWorkerOptions.workerSrc = pdfWorker
@@ -56,13 +67,20 @@ function isPdfPath(fullPath: string) {
   return pdfExtensions.has(getFileExtension(fullPath))
 }
 
-function toFileUrl(fullPath: string) {
-  return encodeURI(`file://${fullPath}`)
+function base64ToUint8Array(base64: string) {
+  const binary = window.atob(base64)
+  const bytes = new Uint8Array(binary.length)
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+
+  return bytes
 }
 
-async function getPdfPreview(targetPath: string) {
+async function getPdfPreview(pdfBase64: string) {
   try {
-    const loadingTask = getDocument(toFileUrl(targetPath))
+    const loadingTask = getDocument({ data: base64ToUint8Array(pdfBase64) })
     const pdf = await loadingTask.promise
     const page = await pdf.getPage(1)
     const viewport = page.getViewport({ scale: 1 })
@@ -103,6 +121,44 @@ function normalizeDroppedPath(rawPath: string) {
   return trimmed
 }
 
+function joinMacPath(basePath: string, child: string) {
+  return basePath.endsWith('/') ? `${basePath}${child}` : `${basePath}/${child}`
+}
+
+function getParentPath(targetPath: string) {
+  const normalized = targetPath.replaceAll('\\', '/')
+  const lastSlashIndex = normalized.lastIndexOf('/')
+  if (lastSlashIndex <= 0) return normalized
+  return normalized.slice(0, lastSlashIndex)
+}
+
+function getEditableName(node: ExplorerNode) {
+  if (node.type === 'folder') return node.name
+  const extension = `.${getFileExtension(node.path)}`
+  return extension && node.name.endsWith(extension)
+    ? node.name.slice(0, -extension.length)
+    : node.name
+}
+
+function applyPathReplacement(paths: string[], previousPath: string, nextPath: string) {
+  return paths.map((item) => item === previousPath ? nextPath : item)
+}
+
+function getNodeIcon(node: ExplorerNode) {
+  if (node.type === 'folder') return Folder
+  if (isPdfPath(node.path)) return FileText
+  if (isImagePath(node.path)) return FileImage
+  return File
+}
+
+function getPathIcon(targetPath: string) {
+  if (isPdfPath(targetPath)) return FileText
+  if (isImagePath(targetPath)) return FileImage
+  return File
+}
+
+const INTERNAL_APP_DRAG_TYPE = 'application/x-offline-docs-paths'
+
 export function OrganizerPage() {
   const { t, language } = useI18n()
   const jobs = useJobStore((state) => state.jobs)
@@ -115,6 +171,7 @@ export function OrganizerPage() {
   const [rootPath, setRootPath] = useState('')
   const [treeByPath, setTreeByPath] = useState<Record<string, ExplorerNode[]>>({})
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
+  const [explorerSelectedPaths, setExplorerSelectedPaths] = useState<string[]>([])
   const [operation, setOperation] = useState<OperationId>('batch_rename')
   const [renamePattern, setRenamePattern] = useState('{name}_{seq}')
   const [isStarting, setIsStarting] = useState(false)
@@ -123,9 +180,16 @@ export function OrganizerPage() {
   const [draggedPath, setDraggedPath] = useState<string | null>(null)
   const [dragOverPath, setDragOverPath] = useState<string | null>(null)
   const [previewByPath, setPreviewByPath] = useState<Record<string, string>>({})
+  const [previewLoadingByPath, setPreviewLoadingByPath] = useState<Record<string, boolean>>({})
   const [expandedPreviewPath, setExpandedPreviewPath] = useState<string | null>(null)
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
+  const [renameInline, setRenameInline] = useState<RenameInlineState | null>(null)
   const previewByPathRef = useRef<Record<string, string>>({})
+  const previewLoadingByPathRef = useRef<Record<string, boolean>>({})
+  const rootPathRef = useRef('')
   const selectedPathsRef = useRef<string[]>([])
+  const renameInputRef = useRef<HTMLInputElement | null>(null)
+  const renameStartedForPathRef = useRef<string | null>(null)
 
   const activeJobs = useMemo(
     () => jobs.filter((job) => job.status === 'running' || job.status === 'idle').slice(0, 5),
@@ -134,109 +198,204 @@ export function OrganizerPage() {
 
   const toolkit = window.toolkit
 
-  const loadDirectory = async (targetPath: string): Promise<DirectoryListing> => {
+  const visibleFilePaths = useMemo(() => {
+    const result: string[] = []
+
+    const walk = (targetPath: string) => {
+      const nodes = treeByPath[targetPath] || []
+      for (const node of nodes) {
+        if (node.type === 'file') result.push(node.path)
+        if (node.type === 'folder' && expandedPaths.has(node.path)) {
+          walk(node.path)
+        }
+      }
+    }
+
+    if (rootPath) walk(rootPath)
+    return result
+  }, [expandedPaths, rootPath, treeByPath])
+
+  const loadDirectory = useCallback(async (targetPath: string): Promise<DirectoryListing> => {
     const data = (await toolkit.organizer.list(targetPath)) as DirectoryListing
     const entries = [...data.folders, ...data.files]
     setTreeByPath((prev) => ({ ...prev, [data.currentPath]: entries }))
     return data
-  }
+  }, [toolkit])
 
   const loadTree = async (startPath: string) => {
     setIsLoadingTree(true)
+    setRootPath(startPath)
     try {
-      const nextTree: Record<string, ExplorerNode[]> = {}
-      const nextExpanded = new Set<string>()
-
-      const walk = async (targetPath: string): Promise<void> => {
-        const data = (await toolkit.organizer.list(targetPath)) as DirectoryListing
-        const entries = [...data.folders, ...data.files]
-        nextTree[data.currentPath] = entries
-        nextExpanded.add(data.currentPath)
-
-        for (const folder of data.folders) {
-          await walk(folder.path)
-        }
-      }
-
-      await walk(startPath)
-      setRootPath(startPath)
-      setTreeByPath(nextTree)
-      setExpandedPaths(nextExpanded)
+      const rootData = await loadDirectory(startPath)
+      setExpandedPaths(new Set([rootData.currentPath]))
     } finally {
       setIsLoadingTree(false)
     }
   }
 
   useEffect(() => {
-    previewByPathRef.current = previewByPath
-  }, [previewByPath])
-
-  useEffect(() => {
     selectedPathsRef.current = selectedPaths
   }, [selectedPaths])
 
   useEffect(() => {
+    setExplorerSelectedPaths((previous) => previous.filter((item) => visibleFilePaths.includes(item)))
+  }, [visibleFilePaths])
+
+  useEffect(() => {
+    rootPathRef.current = rootPath
+  }, [rootPath])
+
+  useEffect(() => {
+    previewByPathRef.current = previewByPath
+  }, [previewByPath])
+
+  useEffect(() => {
+    previewLoadingByPathRef.current = previewLoadingByPath
+  }, [previewLoadingByPath])
+
+  useEffect(() => {
+    if (!contextMenu) return
+
+    const closeMenu = () => setContextMenu(null)
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('blur', closeMenu)
+
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('blur', closeMenu)
+    }
+  }, [contextMenu])
+
+  useEffect(() => {
+    if (!renameInline || !renameInputRef.current) {
+      renameStartedForPathRef.current = null
+      return
+    }
+    if (renameStartedForPathRef.current === renameInline.path) return
+    renameStartedForPathRef.current = renameInline.path
+    renameInputRef.current.focus()
+    renameInputRef.current.select()
+  }, [renameInline])
+
+  useEffect(() => {
     const init = async () => {
       const home = await toolkit.organizer.getHome()
-      await loadTree(home)
+      const desktopPath = joinMacPath(home, 'Desktop')
+
+      try {
+        await loadTree(desktopPath)
+      } catch {
+        await loadTree(home)
+      }
     }
     init()
   }, [toolkit])
 
-  useEffect(() => {
-    if (!toolkit?.getImagePreview) return
+  const handleExplorerSelection = (targetPath: string, event: MouseEvent<HTMLButtonElement>) => {
+    const isRangeSelection = event.shiftKey
+    const isMultiSelection = event.metaKey || event.ctrlKey
 
-    let isDisposed = false
-    const previewablePaths = selectedPaths.filter((filePath) => isImagePath(filePath) || isPdfPath(filePath))
+    setExplorerSelectedPaths((previous) => {
+      if (isRangeSelection && previous.length > 0) {
+        const anchorPath = previous[previous.length - 1]
+        const anchorIndex = visibleFilePaths.indexOf(anchorPath)
+        const targetIndex = visibleFilePaths.indexOf(targetPath)
 
-    setPreviewByPath((previous) => {
-      const next: Record<string, string> = {}
-      for (const filePath of previewablePaths) {
-        if (previous[filePath]) next[filePath] = previous[filePath]
+        if (anchorIndex >= 0 && targetIndex >= 0) {
+          const [start, end] = anchorIndex < targetIndex
+            ? [anchorIndex, targetIndex]
+            : [targetIndex, anchorIndex]
+          const rangePaths = visibleFilePaths.slice(start, end + 1)
+          return [...new Set([...previous, ...rangePaths])]
+        }
       }
+
+      if (isMultiSelection) {
+        return previous.includes(targetPath)
+          ? previous.filter((item) => item !== targetPath)
+          : [...previous, targetPath]
+      }
+
+      return [targetPath]
+    })
+  }
+
+  const addExplorerSelection = () => {
+    if (explorerSelectedPaths.length === 0) return
+
+    setSelectedPaths([...new Set([...selectedPaths, ...explorerSelectedPaths])])
+  }
+
+  const createSubfolder = async (node: ExplorerNode) => {
+    if (node.type !== 'folder') return
+
+    setExpandedPaths((previous) => {
+      const next = new Set(previous)
+      next.add(node.path)
       return next
     })
 
-    const loadMissingPreviews = async () => {
-      const loaded: Record<string, string> = {}
-      for (const filePath of previewablePaths) {
-        const alreadyLoaded = previewByPathRef.current[filePath]
-        if (alreadyLoaded) continue
-        const preview = isImagePath(filePath)
-          ? await toolkit.getImagePreview(filePath)
-          : await getPdfPreview(filePath)
-        if (preview) loaded[filePath] = preview
-      }
-
-      if (!isDisposed && Object.keys(loaded).length > 0) {
-        setPreviewByPath((previous) => ({ ...previous, ...loaded }))
-      }
-    }
-
-    loadMissingPreviews()
-    return () => {
-      isDisposed = true
-    }
-  }, [selectedPaths, toolkit])
-
-  useEffect(() => {
-    if (!toolkit?.onJobResult) return
-
-    const unsubscribe = toolkit.onJobResult(() => {
-      if (selectedPathsRef.current.length === 0) return
-      const shouldClear = window.confirm(t('dashboard.clearPrompt'))
-      if (shouldClear) setSelectedPaths([])
+    const createdPath = await toolkit.organizer.createFolder({
+      parentPath: node.path,
+      name: 'Nova pasta',
     })
 
-    return () => unsubscribe()
-  }, [setSelectedPaths, t, toolkit])
+    await refreshTreeFromPaths([createdPath])
+    setRenameInline({
+      path: createdPath,
+      value: 'Nova pasta',
+    })
+  }
 
-  const toggleSelected = (targetPath: string) => {
-    setSelectedPaths(
-      selectedPaths.includes(targetPath)
-        ? selectedPaths.filter((item) => item !== targetPath)
-        : [...selectedPaths, targetPath],
-    )
+  const startInlineRename = (node: ExplorerNode) => {
+    setContextMenu(null)
+    setRenameInline({
+      path: node.path,
+      value: getEditableName(node),
+    })
+  }
+
+  const renameExplorerNode = async (node: ExplorerNode, nextBaseName: string) => {
+    const normalizedName = nextBaseName.trim()
+    if (!normalizedName) {
+      setRenameInline(null)
+      return
+    }
+
+    if (normalizedName === getEditableName(node)) {
+      setRenameInline(null)
+      return
+    }
+
+    const nextBaseValue = normalizedName
+
+    const nextName = node.type === 'file'
+      ? `${nextBaseValue}.${getFileExtension(node.path)}`
+      : nextBaseValue
+
+    const nextPath = await toolkit.organizer.renamePath({
+      targetPath: node.path,
+      newName: nextName,
+    })
+
+    await refreshTreeFromPaths([node.path, nextPath])
+
+    setExplorerSelectedPaths((previous) => applyPathReplacement(previous, node.path, nextPath))
+    setSelectedPaths(applyPathReplacement(selectedPathsRef.current, node.path, nextPath))
+    setPreviewByPath((previous) => {
+      if (!previous[node.path]) return previous
+      const next = { ...previous, [nextPath]: previous[node.path] }
+      delete next[node.path]
+      return next
+    })
+    setPreviewLoadingByPath((previous) => {
+      if (!previous[node.path]) return previous
+      const next = { ...previous, [nextPath]: previous[node.path] }
+      delete next[node.path]
+      return next
+    })
+    if (expandedPreviewPath === node.path) setExpandedPreviewPath(nextPath)
+    setRenameInline(null)
   }
 
   const toggleFolder = async (folderPath: string) => {
@@ -274,6 +433,19 @@ export function OrganizerPage() {
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
     setIsDragActive(false)
+
+    const internalPayload = event.dataTransfer.getData(INTERNAL_APP_DRAG_TYPE)
+    if (internalPayload) {
+      try {
+        const internalPaths = JSON.parse(internalPayload) as string[]
+        if (internalPaths.length > 0) {
+          setSelectedPaths([...new Set([...selectedPaths, ...internalPaths])])
+          return
+        }
+      } catch {
+        // Fall back to external drag/drop parsing below.
+      }
+    }
 
     const droppedFromFiles = Array.from(event.dataTransfer.files).map((file) => {
       return normalizeDroppedPath(
@@ -321,9 +493,130 @@ export function OrganizerPage() {
     setDragOverPath(null)
   }
 
+  const handleExplorerDragStart = (event: DragEvent<HTMLDivElement>, targetPath: string) => {
+    const dragPaths = explorerSelectedPaths.includes(targetPath) && explorerSelectedPaths.length > 1
+      ? explorerSelectedPaths
+      : [targetPath]
+
+    event.dataTransfer.setData(INTERNAL_APP_DRAG_TYPE, JSON.stringify(dragPaths))
+    event.dataTransfer.setData('text/plain', dragPaths.join('\n'))
+    event.dataTransfer.effectAllowed = 'copy'
+  }
+
+  const handleExplorerKeyDown = (event: KeyboardEvent<HTMLDivElement>, node: ExplorerNode) => {
+    if (node.type === 'folder') return
+    if (renameInline?.path === node.path) return
+
+    if (event.key === 'Enter' || event.key === 'F2') {
+      event.preventDefault()
+      startInlineRename(node)
+    }
+  }
+
+  const handleNativeDragStart = (event: DragEvent<HTMLLIElement>, targetPath: string) => {
+    const dragPaths = selectedPaths.includes(targetPath) && selectedPaths.length > 1
+      ? selectedPaths
+      : [targetPath]
+
+    setDraggedPath(targetPath)
+    event.dataTransfer.setData(INTERNAL_APP_DRAG_TYPE, JSON.stringify(dragPaths))
+    event.dataTransfer.setData('text/plain', dragPaths.join('\n'))
+    event.dataTransfer.effectAllowed = 'copyMove'
+    toolkit.startNativeDrag(dragPaths)
+  }
+
   const removeItem = (targetPath: string) => {
     setSelectedPaths(selectedPaths.filter((path) => path !== targetPath))
   }
+
+  const loadPreview = useCallback(async (targetPath: string) => {
+    if (previewByPathRef.current[targetPath] || previewLoadingByPathRef.current[targetPath]) return
+
+    setPreviewLoadingByPath((previous) => ({ ...previous, [targetPath]: true }))
+
+    try {
+      const preview = isImagePath(targetPath)
+        ? await toolkit.getImagePreview(targetPath)
+        : isPdfPath(targetPath)
+          ? await toolkit.getPdfBuffer(targetPath).then((pdfBase64) => pdfBase64 ? getPdfPreview(pdfBase64) : null)
+          : null
+
+      if (preview) {
+        setPreviewByPath((previous) => ({ ...previous, [targetPath]: preview }))
+      }
+    } finally {
+      setPreviewLoadingByPath((previous) => ({ ...previous, [targetPath]: false }))
+    }
+  }, [toolkit])
+
+  const refreshTreeFromPaths = useCallback(async (paths: string[]) => {
+    const currentRoot = rootPathRef.current
+    if (!currentRoot || paths.length === 0) return
+
+    const directories = [...new Set(paths.map(getParentPath))]
+      .filter((directoryPath) => directoryPath.startsWith(currentRoot))
+
+    await Promise.all(directories.map(async (directoryPath) => {
+      try {
+        await loadDirectory(directoryPath)
+      } catch {
+        setTreeByPath((previous) => {
+          const next = { ...previous }
+          delete next[directoryPath]
+          return next
+        })
+      }
+    }))
+
+    if (directories.length > 0) {
+      try {
+        await loadDirectory(currentRoot)
+      } catch {
+        // Ignore root refresh failures and keep the current tree visible.
+      }
+    }
+  }, [loadDirectory])
+
+  useEffect(() => {
+    if (!toolkit?.onJobResult) return
+
+    const unsubscribe = toolkit.onJobResult((payload) => {
+      const previousSelection = selectedPathsRef.current
+      const nextSelection = payload.paths && payload.paths.length > 0 ? payload.paths : previousSelection
+
+      void refreshTreeFromPaths([...previousSelection, ...nextSelection])
+
+      if (previousSelection.length === 0) return
+      setSelectedPaths([])
+      setExplorerSelectedPaths([])
+    })
+
+    return () => unsubscribe()
+  }, [refreshTreeFromPaths, setSelectedPaths, t, toolkit])
+
+  useEffect(() => {
+    const previewablePaths = selectedPaths.filter((filePath) => isImagePath(filePath) || isPdfPath(filePath))
+
+    setPreviewByPath((previous) => {
+      const next: Record<string, string> = {}
+      for (const filePath of previewablePaths) {
+        if (previous[filePath]) next[filePath] = previous[filePath]
+      }
+      return next
+    })
+
+    setPreviewLoadingByPath((previous) => {
+      const next: Record<string, boolean> = {}
+      for (const filePath of previewablePaths) {
+        if (previous[filePath]) next[filePath] = previous[filePath]
+      }
+      return next
+    })
+
+    for (const filePath of previewablePaths) {
+      void loadPreview(filePath)
+    }
+  }, [selectedPaths, loadPreview])
 
   const runJob = async () => {
     if (selectedPaths.length === 0) return
@@ -351,44 +644,105 @@ export function OrganizerPage() {
     return nodes.map((node) => {
       const isFolder = node.type === 'folder'
       const isExpanded = isFolder ? expandedPaths.has(node.path) : false
-      const isSelected = selectedPaths.includes(node.path)
+      const isExplorerSelected = explorerSelectedPaths.includes(node.path)
+      const isAdded = selectedPaths.includes(node.path)
+      const isRenaming = renameInline?.path === node.path
+      const Icon = getNodeIcon(node)
 
       return (
         <div key={node.path} className='space-y-1'>
           <div
+            draggable={!isFolder}
+            tabIndex={isFolder ? -1 : 0}
+            onDragStart={(event) => {
+              if (isFolder) return
+              handleExplorerDragStart(event, node.path)
+            }}
+            onContextMenu={(event) => {
+              event.preventDefault()
+              setContextMenu({
+                node,
+                x: event.clientX,
+                y: event.clientY,
+              })
+            }}
+            onClick={(event) => {
+              if (isFolder) return
+              handleExplorerSelection(node.path, event as unknown as MouseEvent<HTMLButtonElement>)
+            }}
+            onDoubleClick={() => isFolder && toggleFolder(node.path)}
+            onKeyDown={(event) => handleExplorerKeyDown(event, node)}
             className={[
-              'flex items-center gap-2 rounded-xl px-2 py-1.5 text-sm transition-colors hover:bg-black/5',
-              isSelected ? 'bg-[var(--surface-2)]' : '',
+              'flex cursor-pointer items-center gap-2 rounded-lg border px-2 py-1 text-[13px] transition-colors hover:bg-black/5 focus:outline-none focus:ring-2 focus:ring-cyan-100',
+              isExplorerSelected
+                ? 'border-[var(--primary)] bg-cyan-50 text-[var(--text)]'
+                : 'border-transparent',
             ].join(' ')}
-            style={{ paddingLeft: `${depth * 14 + 8}px` }}
           >
+            <span
+              aria-hidden='true'
+              className='shrink-0'
+              style={{ width: `${depth * 14}px` }}
+            />
+
             {isFolder ? (
               <button
                 type='button'
-                className='w-5 text-left text-xs text-[var(--muted)]'
-                onClick={() => toggleFolder(node.path)}
+                className='flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-xs text-[var(--muted)] hover:bg-black/5'
+                onClick={(event) => {
+                  event.stopPropagation()
+                  toggleFolder(node.path)
+                }}
               >
                 {isExpanded ? '▾' : '▸'}
               </button>
             ) : (
-              <span className='inline-block w-5 text-center text-xs text-[var(--muted)]'>•</span>
+              <span className='h-6 w-6 shrink-0' />
             )}
 
-            <input
-              type='checkbox'
-              checked={isSelected}
-              onChange={() => toggleSelected(node.path)}
-              className='h-4 w-4 rounded border-[var(--border)]'
-            />
+            <span className={[
+              'flex h-6 w-6 shrink-0 items-center justify-center rounded-md border',
+              isFolder
+                ? 'border-amber-200 bg-amber-50 text-amber-600'
+                : isPdfPath(node.path)
+                  ? 'border-rose-200 bg-rose-50 text-rose-600'
+                  : isImagePath(node.path)
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-600'
+                    : 'border-slate-200 bg-slate-50 text-slate-500',
+            ].join(' ')}>
+              <Icon size={13} />
+            </span>
 
-            <button
-              type='button'
-              className='min-w-0 flex-1 truncate text-left'
-              onClick={() => isFolder ? toggleFolder(node.path) : toggleSelected(node.path)}
-              title={node.path}
-            >
-              {node.name}
-            </button>
+            <div className='min-w-0 flex-1 truncate' title={node.path}>
+              {isRenaming ? (
+                <input
+                  ref={renameInputRef}
+                  value={renameInline.value}
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={(event) => setRenameInline({ path: node.path, value: event.target.value })}
+                  onBlur={() => void renameExplorerNode(node, renameInline.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      void renameExplorerNode(node, renameInline.value)
+                    }
+                    if (event.key === 'Escape') {
+                      event.preventDefault()
+                      setRenameInline(null)
+                    }
+                  }}
+                  className='w-full rounded-md border border-transparent bg-white/80 px-1.5 py-0.5 text-[13px] text-[var(--text)] outline-none ring-0 shadow-[0_0_0_1px_rgba(14,165,233,0.28)]'
+                />
+              ) : (
+                node.name
+              )}
+            </div>
+
+            {isAdded && (
+              <span className='rounded-full bg-emerald-100 px-2 py-1 text-[11px] font-medium text-emerald-700'>
+                Na lista
+              </span>
+            )}
           </div>
 
           {isFolder && isExpanded && treeByPath[node.path] && (
@@ -447,12 +801,22 @@ export function OrganizerPage() {
               </div>
               <p className='truncate text-xs text-[var(--muted)]'>{rootPath || t('common.notAvailable')}</p>
             </div>
-            <span className='rounded-full bg-[var(--surface-2)] px-2 py-1 text-xs text-[var(--muted)]'>
-              {selectedPaths.length} {t('organizer.selectedCount').toLowerCase()}
-            </span>
+            <div className='flex items-center gap-2'>
+              <Button
+                variant='secondary'
+                className='h-8 px-3 text-xs'
+                onClick={addExplorerSelection}
+                disabled={explorerSelectedPaths.length === 0}
+              >
+                Adicionar selecionados
+              </Button>
+            </div>
           </div>
 
           <div className='overflow-auto pr-1'>
+            {isLoadingTree && !treeByPath[rootPath] && (
+              <p className='mb-2 text-xs text-[var(--muted)]'>Carregando pastas do Mac...</p>
+            )}
             {rootPath && treeByPath[rootPath] ? (
               renderTree(rootPath, 0)
             ) : (
@@ -573,7 +937,7 @@ export function OrganizerPage() {
                 <li
                   key={path}
                   draggable
-                  onDragStart={() => setDraggedPath(path)}
+                  onDragStart={(event) => handleNativeDragStart(event, path)}
                   onDragEnd={() => {
                     setDraggedPath(null)
                     setDragOverPath(null)
@@ -608,9 +972,13 @@ export function OrganizerPage() {
                             <img src={previewByPath[path]} alt={getFileName(path)} className='h-full w-full object-cover' />
                           </button>
                         ) : (
-                          <div className='flex h-full w-full items-center justify-center text-xs font-semibold uppercase text-[var(--muted)]'>
-                            {isPdfPath(path) ? 'PDF' : 'IMG'}
-                          </div>
+                          <button
+                            type='button'
+                            className='flex h-full w-full items-center justify-center px-3 text-center text-xs font-semibold uppercase text-[var(--muted)]'
+                            onClick={() => loadPreview(path)}
+                          >
+                            {previewLoadingByPath[path] ? 'Carregando...' : isPdfPath(path) ? 'Carregar PDF' : 'Carregar imagem'}
+                          </button>
                         )
                       ) : (
                         <div className='flex h-full w-full items-center justify-center text-xs font-semibold uppercase text-[var(--muted)]'>
@@ -620,7 +988,24 @@ export function OrganizerPage() {
                     </div>
 
                     <div className='min-w-0'>
-                      <p className='truncate font-medium text-[var(--text)]'>{getFileName(path)}</p>
+                      <div className='flex items-center gap-2'>
+                        {(() => {
+                          const Icon = getPathIcon(path)
+                          return (
+                            <span className={[
+                              'flex h-8 w-8 items-center justify-center rounded-lg border',
+                              isPdfPath(path)
+                                ? 'border-rose-200 bg-rose-50 text-rose-600'
+                                : isImagePath(path)
+                                  ? 'border-emerald-200 bg-emerald-50 text-emerald-600'
+                                  : 'border-slate-200 bg-slate-50 text-slate-500',
+                            ].join(' ')}>
+                              <Icon size={16} />
+                            </span>
+                          )
+                        })()}
+                        <p className='truncate font-medium text-[var(--text)]'>{getFileName(path)}</p>
+                      </div>
                       <p className='truncate text-xs'>{path}</p>
                     </div>
                   </div>
@@ -650,6 +1035,48 @@ export function OrganizerPage() {
           </div>
         </div>
       )}
+
+      {contextMenu && (
+        <div
+          className='fixed z-50 min-w-48 rounded-xl border border-[var(--border)] bg-white p-1 shadow-lg'
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type='button'
+            className='flex w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--surface-2)]'
+            onClick={() => {
+              startInlineRename(contextMenu.node)
+            }}
+          >
+            Renomear
+          </button>
+          {contextMenu.node.type === 'folder' && (
+            <button
+              type='button'
+              className='flex w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--surface-2)]'
+              onClick={async () => {
+                const folderNode = contextMenu.node
+                setContextMenu(null)
+                await createSubfolder(folderNode)
+              }}
+            >
+              Nova subpasta
+            </button>
+          )}
+          <button
+            type='button'
+            className='flex w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-[var(--surface-2)]'
+            onClick={() => {
+              toolkit.revealInFolder(contextMenu.node.path)
+              setContextMenu(null)
+            }}
+          >
+            Mostrar na pasta
+          </button>
+        </div>
+      )}
+
     </div>
   )
 }

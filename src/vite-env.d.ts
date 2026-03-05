@@ -11,9 +11,13 @@ declare global {
       startJob: (payload: { name: string; operation: string; paths: string[]; renamePattern?: string }) => Promise<JobRecord>
       getPathForFile: (file: File) => string
       getImagePreview: (targetPath: string) => Promise<string | null>
+      getPdfBuffer: (targetPath: string) => Promise<string | null>
       revealInFolder: (targetPath: string) => Promise<void>
+      startNativeDrag: (paths: string[]) => void
       onJobProgress: (listener: (payload: JobRecord) => void) => () => void
-      onJobResult: (listener: (payload: { id: string; outputPath: string; totalFiles: number }) => void) => () => void
+      onJobResult: (
+        listener: (payload: { id: string; outputPath: string; totalFiles: number; paths?: string[] }) => void
+      ) => () => void
       onJobError: (
         listener: (payload: { id: string; operation: string; message: string; detail: string; at: string }) => void
       ) => () => void

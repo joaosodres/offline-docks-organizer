@@ -153,10 +153,13 @@ export function DashboardPage() {
   useEffect(() => {
     if (!toolkit?.onJobResult) return
 
-    const unsubscribe = toolkit.onJobResult(() => {
+    const unsubscribe = toolkit.onJobResult((payload) => {
       if (selectedPathsRef.current.length === 0) return
-      const shouldClear = window.confirm(t('dashboard.clearPrompt'))
-      if (shouldClear) setSelectedPaths([])
+      if (payload.paths && payload.paths.length > 0) {
+        setSelectedPaths(payload.paths)
+        return
+      }
+      setSelectedPaths([])
     })
 
     return () => unsubscribe()

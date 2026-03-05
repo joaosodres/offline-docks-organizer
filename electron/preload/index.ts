@@ -29,7 +29,9 @@ contextBridge.exposeInMainWorld('toolkit', {
     ipcRenderer.invoke('toolkit:start-job', payload),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   getImagePreview: (targetPath: string) => ipcRenderer.invoke('toolkit:get-image-preview', targetPath),
+  getPdfBuffer: (targetPath: string) => ipcRenderer.invoke('toolkit:get-pdf-buffer', targetPath),
   revealInFolder: (targetPath: string) => ipcRenderer.invoke('toolkit:reveal-in-folder', targetPath),
+  startNativeDrag: (paths: string[]) => ipcRenderer.send('toolkit:start-native-drag', { paths }),
   onJobProgress: (
     listener: (payload: {
       id: string
@@ -55,9 +57,12 @@ contextBridge.exposeInMainWorld('toolkit', {
     return () => ipcRenderer.off('toolkit:job-progress', wrappedListener)
   },
   onJobResult: (
-    listener: (payload: { id: string; outputPath: string; totalFiles: number }) => void,
+    listener: (payload: { id: string; outputPath: string; totalFiles: number; paths?: string[] }) => void,
   ) => {
-    const wrappedListener = (_event: unknown, payload: { id: string; outputPath: string; totalFiles: number }) =>
+    const wrappedListener = (
+      _event: unknown,
+      payload: { id: string; outputPath: string; totalFiles: number; paths?: string[] },
+    ) =>
       listener(payload)
 
     ipcRenderer.on('toolkit:job-result', wrappedListener)

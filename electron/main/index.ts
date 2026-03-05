@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import os from 'node:os'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
 import { PDFDocument } from 'pdf-lib'
 import * as XLSX from 'xlsx'
 import { update } from './update'
@@ -57,6 +57,20 @@ const mimeByExtension: Record<string, string> = {
   tif: 'image/tiff',
   tiff: 'image/tiff',
 }
+const supportedOrganizerExtensions = new Set([
+  'pdf',
+  'csv',
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'gif',
+  'bmp',
+  'tif',
+  'tiff',
+  'heic',
+  'heif',
+])
 
 function formatWithPattern(input: { pattern: string; originalName: string; seq: number }) {
   const date = new Date().toISOString().slice(0, 10)
@@ -114,6 +128,27 @@ async function ensureUniquePath(targetPath: string) {
   }
 }
 
+async function ensureSafeRenameTarget(targetPath: string, reservedPaths: Set<string>, sourcePath?: string) {
+  let candidate = targetPath
+  let suffix = 1
+
+  while (true) {
+    const reservedConflict = reservedPaths.has(candidate) && candidate !== sourcePath
+    if (!reservedConflict) {
+      try {
+        await stat(candidate)
+        if (candidate === sourcePath) return candidate
+      } catch {
+        return candidate
+      }
+    }
+
+    const parsed = path.parse(targetPath)
+    candidate = path.join(parsed.dir, `${parsed.name}_${suffix}${parsed.ext}`)
+    suffix += 1
+  }
+}
+
 function formatOutputName(base: string, extension: string) {
   const safeBase = base.replace(/[<>:\"/\\|?*]/g, '_')
   return `${safeBase}${extension}`
@@ -131,7 +166,7 @@ function emitJobProgress(payload: {
   win?.webContents.send('toolkit:job-progress', payload)
 }
 
-function emitJobResult(payload: { id: string; outputPath: string; totalFiles: number }) {
+function emitJobResult(payload: { id: string; outputPath: string; totalFiles: number; paths?: string[] }) {
   win?.webContents.send('toolkit:job-result', payload)
 }
 
@@ -224,11 +259,7 @@ async function runBatchRename(params: {
     }).replace(/[<>:\"/\\|?*]/g, '_')
 
     let nextPath = path.join(parsed.dir, `${nextNameBase}${parsed.ext}`)
-    let suffix = 1
-    while (reservedPaths.has(nextPath)) {
-      nextPath = path.join(parsed.dir, `${nextNameBase}_${suffix}${parsed.ext}`)
-      suffix += 1
-    }
+    nextPath = await ensureSafeRenameTarget(nextPath, reservedPaths, sourcePath)
     reservedPaths.add(nextPath)
 
     if (sourcePath !== nextPath) {
@@ -251,10 +282,11 @@ async function runBatchRename(params: {
   }
 
   if (renamedPaths.length > 0) {
-    win?.webContents.send('toolkit:job-result', {
+    emitJobResult({
       id: params.id,
       outputPath: renamedPaths[0],
       totalFiles,
+      paths: renamedPaths,
     })
   }
 }
@@ -766,6 +798,17 @@ ipcMain.handle('toolkit:reveal-in-folder', (_, targetPath: string) => {
   shell.showItemInFolder(targetPath)
 })
 
+ipcMain.on('toolkit:start-native-drag', (_, payload: { paths: string[] }) => {
+  if (!win || !payload.paths || payload.paths.length === 0) return
+
+  const iconPath = path.join(process.env.APP_ROOT, 'build', 'icon.png')
+  win.webContents.startDrag({
+    file: payload.paths[0],
+    files: payload.paths,
+    icon: iconPath,
+  })
+})
+
 ipcMain.handle('toolkit:get-image-preview', async (_, targetPath: string) => {
   const extension = path.extname(targetPath).replace('.', '').toLowerCase()
   const mimeType = mimeByExtension[extension]
@@ -774,6 +817,15 @@ ipcMain.handle('toolkit:get-image-preview', async (_, targetPath: string) => {
   try {
     const fileBuffer = await readFile(targetPath)
     return `data:${mimeType};base64,${fileBuffer.toString('base64')}`
+  } catch {
+    return null
+  }
+})
+
+ipcMain.handle('toolkit:get-pdf-buffer', async (_, targetPath: string) => {
+  try {
+    const fileBuffer = await readFile(targetPath)
+    return fileBuffer.toString('base64')
   } catch {
     return null
   }
@@ -806,7 +858,11 @@ ipcMain.handle('toolkit:organizer-list', async (_, targetPath: string) => {
     }))
 
   const files = visibleEntries
-    .filter((entry) => entry.isFile())
+    .filter((entry) => {
+      if (!entry.isFile()) return false
+      const extension = path.extname(entry.name).replace('.', '').toLowerCase()
+      return supportedOrganizerExtensions.has(extension)
+    })
     .map((entry) => ({
       name: entry.name,
       path: path.join(currentPath, entry.name),
@@ -822,21 +878,26 @@ ipcMain.handle('toolkit:organizer-list', async (_, targetPath: string) => {
 })
 
 ipcMain.handle('toolkit:organizer-create-folder', async (_, payload: { parentPath: string; name: string }) => {
-  const targetPath = path.join(payload.parentPath, payload.name)
+  const requestedPath = path.join(payload.parentPath, payload.name)
+  const targetPath = await ensureUniquePath(requestedPath)
   await mkdir(targetPath, { recursive: true })
   return targetPath
 })
 
 ipcMain.handle('toolkit:organizer-rename-path', async (_, payload: { targetPath: string; newName: string }) => {
-  const nextPath = path.join(path.dirname(payload.targetPath), payload.newName)
+  const requestedPath = path.join(path.dirname(payload.targetPath), payload.newName)
+  const nextPath = await ensureSafeRenameTarget(requestedPath, new Set(), payload.targetPath)
   await rename(payload.targetPath, nextPath)
   return nextPath
 })
 
 ipcMain.handle('toolkit:organizer-move-paths', async (_, payload: { sourcePaths: string[]; destinationDir: string }) => {
   const movedPaths: string[] = []
+  const reservedPaths = new Set<string>()
   for (const sourcePath of payload.sourcePaths) {
-    const destinationPath = path.join(payload.destinationDir, path.basename(sourcePath))
+    const requestedPath = path.join(payload.destinationDir, path.basename(sourcePath))
+    const destinationPath = await ensureSafeRenameTarget(requestedPath, reservedPaths, sourcePath)
+    reservedPaths.add(destinationPath)
     await rename(sourcePath, destinationPath)
     movedPaths.push(destinationPath)
   }
@@ -844,8 +905,6 @@ ipcMain.handle('toolkit:organizer-move-paths', async (_, payload: { sourcePaths:
 })
 
 ipcMain.handle('toolkit:organizer-delete-paths', async (_, payload: { paths: string[] }) => {
-  for (const targetPath of payload.paths) {
-    await rm(targetPath, { recursive: true, force: true })
-  }
-  return true
+  console.warn('[toolkit] delete blocked by safety policy', payload.paths)
+  throw new Error('Delete is disabled by safety policy. This app does not remove user files.')
 })
