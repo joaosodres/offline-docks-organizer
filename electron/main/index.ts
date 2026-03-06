@@ -11,7 +11,6 @@ import { translations, type SupportedLanguage } from '../../src/i18n/translation
 import type { AppStateSnapshot, JobError, JobRecord, JobStatus } from '../../src/types/job'
 import type { JobPreset } from '../../src/types/preset'
 import { defaultSettings, type AppSettings } from '../../src/types/settings'
-import { update } from './update'
 
 const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -835,8 +834,6 @@ async function createWindow() {
     return { action: 'deny' }
   })
 
-  // Auto update
-  update(win)
 }
 
 app.whenReady().then(async () => {

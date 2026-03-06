@@ -1,43 +1,63 @@
 # Offline Docs Toolkit
 
-Desktop app for batch document operations with an offline-first workflow.
+Desktop app for local-first batch document work.
 
-## Frontend Stack
+[Português (Brasil)](./README.pt-BR.md)
 
-- Electron + Vite + React + TypeScript
-- TailwindCSS
+## What it does
+
+- Batch rename files
+- Merge PDFs
+- Split PDFs
+- Convert images to PDF
+- Convert CSV to XLSX
+- Organize files locally with previews
+
+Everything runs on the user's machine.
+
+## Download
+
+Download the latest release here:
+
+`https://github.com/joaosodres/offline-docks-organizer/releases`
+
+For most users:
+
+- macOS: download the `.dmg`
+- Windows: download the `.exe`
+
+## Stack
+
+- Electron
+- Vite
+- React
+- TypeScript
 - Zustand
-- TanStack Table + Virtual
-- Radix UI primitives + CVA utility pattern
+- Tailwind CSS
 
-## App Sections
-
-- `Dashboard`: import files/folders and configure operations
-- `Queue`: track jobs and progress
-- `History`: review completed runs
-- `Settings`: local defaults and preferences
-
-## Folder Structure
-
-```txt
-src/
-  app/
-  pages/
-  components/
-  stores/
-  types/
-  lib/
-```
-
-## Run
+## Development
 
 ```bash
 npm install
 npm run dev
 ```
 
-## Test
+## Build
+
+Create local build files:
 
 ```bash
-npm run test
+npm run build
 ```
+
+Publish a tagged release through GitHub Actions:
+
+```bash
+git tag v0.1.0-beta.1
+git push origin v0.1.0-beta.1
+```
+
+## Notes
+
+- macOS builds are not signed yet, so Gatekeeper may show a warning.
+- Auto-update metadata files are generated in releases. End users usually only need the `.dmg` or `.exe`.
