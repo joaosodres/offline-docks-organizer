@@ -51,6 +51,7 @@ export function HistoryPage() {
           <div className='grid gap-4'>
             {doneJobs.map((job) => {
               const tone = job.status === 'success' ? 'success' : job.status === 'error' ? 'error' : 'neutral'
+              const outputPath = job.outputPath
 
               return (
                 <Card key={job.id} className='border border-[#27272a] bg-[#101014] p-0 overflow-hidden'>
@@ -104,8 +105,8 @@ export function HistoryPage() {
                         <Button variant='secondary' onClick={() => void rerunJob(job.id)}>
                           {t('history.rerun')}
                         </Button>
-                        {job.outputPath && (
-                          <Button variant='ghost' onClick={() => void window.toolkit.revealInFolder(job.outputPath)}>
+                        {outputPath && (
+                          <Button variant='ghost' onClick={() => void window.toolkit.revealInFolder(outputPath)}>
                             {t('history.showOutput')}
                           </Button>
                         )}
