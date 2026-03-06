@@ -8,6 +8,9 @@ import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promi
 import { PDFDocument } from 'pdf-lib'
 import * as XLSX from 'xlsx'
 import { translations, type SupportedLanguage } from '../../src/i18n/translations'
+import type { AppStateSnapshot, JobError, JobRecord, JobStatus } from '../../src/types/job'
+import type { JobPreset } from '../../src/types/preset'
+import { defaultSettings, type AppSettings } from '../../src/types/settings'
 import { update } from './update'
 
 const require = createRequire(import.meta.url)
@@ -46,6 +49,7 @@ if (!app.requestSingleInstanceLock()) {
 
 let win: BrowserWindow | null = null
 const runningJobs = new Map<string, NodeJS.Timeout>()
+const jobCancellation = new Map<string, { cancelled: boolean }>()
 const preload = path.join(__dirname, '../preload/index.mjs')
 const indexHtml = path.join(RENDERER_DIST, 'index.html')
 const mimeByExtension: Record<string, string> = {
@@ -72,6 +76,38 @@ const supportedOrganizerExtensions = new Set([
   'heic',
   'heif',
 ])
+const defaultAppState: AppStateSnapshot = {
+  settings: defaultSettings,
+  jobs: [],
+  presets: [],
+}
+let appStateCache: AppStateSnapshot = defaultAppState
+const JOB_CANCELLED_CODE = 'JOB_CANCELLED'
+
+function getAppStatePath() {
+  return path.join(app.getPath('userData'), 'offline-docs-state.json')
+}
+
+function normalizeStoredJob(job: Partial<JobRecord>): JobRecord | null {
+  if (!job.id || !job.name || !job.operation || !job.createdAt) return null
+
+  return {
+    id: job.id,
+    name: job.name,
+    operation: job.operation,
+    totalFiles: typeof job.totalFiles === 'number' ? job.totalFiles : Array.isArray(job.inputPaths) ? job.inputPaths.length : 0,
+    progress: typeof job.progress === 'number' ? job.progress : 0,
+    status: (job.status as JobStatus) ?? 'idle',
+    createdAt: job.createdAt,
+    completedAt: job.completedAt ?? null,
+    inputPaths: Array.isArray(job.inputPaths) ? job.inputPaths : [],
+    outputPath: job.outputPath ?? null,
+    outputPaths: Array.isArray(job.outputPaths) ? job.outputPaths : job.outputPath ? [job.outputPath] : [],
+    renamePattern: typeof job.renamePattern === 'string' ? job.renamePattern : undefined,
+    dryRun: Boolean(job.dryRun),
+    error: job.error ?? null,
+  }
+}
 
 function getMainLanguage(): SupportedLanguage {
   const locale = app.getLocale()
@@ -90,6 +126,104 @@ function getByPath(source: unknown, pathKey: string): string | undefined {
 function tm(key: string) {
   const language = getMainLanguage()
   return getByPath(translations[language] ?? translations.en, key) ?? key
+}
+
+async function loadAppState() {
+  try {
+    const raw = await readFile(getAppStatePath(), 'utf8')
+    const parsed = JSON.parse(raw) as Partial<AppStateSnapshot>
+    appStateCache = {
+      settings: { ...defaultSettings, ...(parsed.settings ?? {}) },
+      jobs: Array.isArray(parsed.jobs) ? parsed.jobs.map((job) => normalizeStoredJob(job)).filter((job): job is JobRecord => Boolean(job)) : [],
+      presets: Array.isArray(parsed.presets)
+        ? parsed.presets.filter((preset): preset is JobPreset => Boolean(preset?.id && preset?.name))
+        : [],
+    }
+  } catch {
+    appStateCache = defaultAppState
+  }
+
+  return appStateCache
+}
+
+async function saveAppState(nextState: AppStateSnapshot) {
+  appStateCache = nextState
+  const appStatePath = getAppStatePath()
+  await mkdir(path.dirname(appStatePath), { recursive: true })
+  await writeFile(appStatePath, JSON.stringify(nextState, null, 2), 'utf8')
+}
+
+async function updateAppState(partial: Partial<AppStateSnapshot>) {
+  await saveAppState({
+    ...appStateCache,
+    ...partial,
+  })
+}
+
+function mergeJob(existing: JobRecord | undefined, next: JobRecord): JobRecord {
+  return {
+    ...(existing ?? {}),
+    ...next,
+    outputPaths: next.outputPaths ?? existing?.outputPaths ?? [],
+    error: next.error ?? existing?.error ?? null,
+    completedAt: next.completedAt ?? existing?.completedAt ?? null,
+    outputPath: next.outputPath ?? existing?.outputPath ?? null,
+  }
+}
+
+async function persistJob(nextJob: JobRecord) {
+  const nextJobs = [...appStateCache.jobs]
+  const index = nextJobs.findIndex((job) => job.id === nextJob.id)
+  if (index === -1) nextJobs.unshift(nextJob)
+  else nextJobs[index] = mergeJob(nextJobs[index], nextJob)
+  await updateAppState({ jobs: nextJobs })
+  return index === -1 ? nextJob : nextJobs[index]
+}
+
+function getStoredJob(jobId: string) {
+  return appStateCache.jobs.find((job) => job.id === jobId)
+}
+
+function createJobRecord(input: {
+  id: string
+  name: string
+  operation: string
+  createdAt: string
+  totalFiles: number
+  inputPaths: string[]
+  renamePattern?: string
+  dryRun?: boolean
+  status?: JobStatus
+  progress?: number
+}): JobRecord {
+  return {
+    id: input.id,
+    name: input.name,
+    operation: input.operation,
+    totalFiles: input.totalFiles,
+    progress: input.progress ?? 0,
+    status: input.status ?? 'running',
+    createdAt: input.createdAt,
+    completedAt: null,
+    inputPaths: input.inputPaths,
+    outputPath: null,
+    outputPaths: [],
+    renamePattern: input.renamePattern,
+    dryRun: input.dryRun ?? false,
+    error: null,
+  }
+}
+
+async function pushJobProgress(nextJob: JobRecord) {
+  const persistedJob = await persistJob(nextJob)
+  win?.webContents.send('toolkit:job-progress', persistedJob)
+  return persistedJob
+}
+
+async function pushJobResult(nextJob: JobRecord, paths?: string[]) {
+  const persistedJob = await persistJob(nextJob)
+  win?.webContents.send('toolkit:job-result', { job: persistedJob, paths })
+  return persistedJob
 }
 
 function formatWithPattern(input: { pattern: string; originalName: string; seq: number }) {
@@ -237,22 +371,6 @@ function formatOutputName(base: string, extension: string) {
   return `${safeBase}${extension}`
 }
 
-function emitJobProgress(payload: {
-  id: string
-  name: string
-  operation: string
-  totalFiles: number
-  progress: number
-  status: 'idle' | 'running' | 'success' | 'error'
-  createdAt: string
-}) {
-  win?.webContents.send('toolkit:job-progress', payload)
-}
-
-function emitJobResult(payload: { id: string; outputPath: string; totalFiles: number; paths?: string[] }) {
-  win?.webContents.send('toolkit:job-result', payload)
-}
-
 function normalizeError(error: unknown) {
   if (error instanceof Error) {
     return {
@@ -266,42 +384,53 @@ function normalizeError(error: unknown) {
   }
 }
 
-function emitJobError(payload: {
-  id: string
-  operation: string
-  message: string
-  detail: string
-  at: string
-}) {
-  console.error(`[toolkit][${payload.operation}] ${payload.message}\n${payload.detail}`)
-  win?.webContents.send('toolkit:job-error', payload)
+function isCancelledError(error: unknown) {
+  return error instanceof Error && error.message === JOB_CANCELLED_CODE
 }
 
-function failJobWithError(params: {
-  id: string
-  name: string
-  operation: string
-  createdAt: string
-  totalFiles: number
-  error: unknown
-}) {
-  const parsed = normalizeError(params.error)
-  emitJobProgress({
-    id: params.id,
-    name: params.name,
-    operation: params.operation,
-    totalFiles: params.totalFiles,
+function throwIfCancelled(jobId: string) {
+  if (jobCancellation.get(jobId)?.cancelled) {
+    throw new Error(JOB_CANCELLED_CODE)
+  }
+}
+
+async function emitJobError(job: JobRecord, error: JobError) {
+  console.error(`[toolkit][${job.operation}] ${error.message}\n${error.detail}`)
+  const persistedJob = await persistJob({ ...job, error })
+  win?.webContents.send('toolkit:job-error', {
+    job: persistedJob,
+    message: error.message,
+    detail: error.detail,
+    at: error.at,
+  })
+}
+
+async function failJobWithError(job: JobRecord, error: unknown) {
+  if (isCancelledError(error)) {
+    const cancelledJob = {
+      ...job,
+      status: 'cancelled' as const,
+      completedAt: new Date().toISOString(),
+      error: null,
+    }
+    await pushJobProgress(cancelledJob)
+    return
+  }
+
+  const parsed = normalizeError(error)
+  const nextJob = {
+    ...job,
     progress: 100,
-    status: 'error',
-    createdAt: params.createdAt,
-  })
-  emitJobError({
-    id: params.id,
-    operation: params.operation,
-    message: parsed.message,
-    detail: parsed.detail,
-    at: new Date().toISOString(),
-  })
+    status: 'error' as const,
+    completedAt: new Date().toISOString(),
+    error: {
+      message: parsed.message,
+      detail: parsed.detail,
+      at: new Date().toISOString(),
+    },
+  }
+  await pushJobProgress(nextJob)
+  await emitJobError(nextJob, nextJob.error)
 }
 
 async function runBatchRename(params: {
@@ -311,21 +440,24 @@ async function runBatchRename(params: {
   createdAt: string
   paths: string[]
   renamePattern?: string
+  dryRun?: boolean
 }) {
   const renamePattern = params.renamePattern?.trim() || '{name}_{seq}'
   const targetFiles = await collectFiles(params.paths)
   const totalFiles = targetFiles.length
+  const baseJob = createJobRecord({
+    id: params.id,
+    name: params.name,
+    operation: params.operation,
+    createdAt: params.createdAt,
+    totalFiles,
+    inputPaths: params.paths,
+    renamePattern,
+    dryRun: params.dryRun,
+  })
 
   if (totalFiles === 0) {
-    win?.webContents.send('toolkit:job-progress', {
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
-      totalFiles: 0,
-      progress: 100,
-      status: 'error',
-      createdAt: params.createdAt,
-    })
+    await failJobWithError(baseJob, new Error(tm('common.unknownError')))
     return
   }
 
@@ -333,6 +465,7 @@ async function runBatchRename(params: {
   const renamedPaths: string[] = []
 
   for (let index = 0; index < targetFiles.length; index += 1) {
+    throwIfCancelled(params.id)
     const sourcePath = targetFiles[index]
     const parsed = path.parse(sourcePath)
     const nextNameBase = formatWithPattern({
@@ -346,31 +479,34 @@ async function runBatchRename(params: {
     reservedPaths.add(nextPath)
 
     if (sourcePath !== nextPath) {
-      await rename(sourcePath, nextPath)
+      if (!params.dryRun) await rename(sourcePath, nextPath)
     }
     renamedPaths.push(nextPath)
 
     const progress = Math.round(((index + 1) / totalFiles) * 100)
     const status = index + 1 === totalFiles ? 'success' : 'running'
 
-    win?.webContents.send('toolkit:job-progress', {
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
+    await pushJobProgress({
+      ...baseJob,
       totalFiles,
       progress,
       status,
-      createdAt: params.createdAt,
+      outputPath: renamedPaths[0] ?? null,
+      outputPaths: renamedPaths,
+      completedAt: status === 'success' ? new Date().toISOString() : null,
     })
   }
 
   if (renamedPaths.length > 0) {
-    emitJobResult({
-      id: params.id,
-      outputPath: renamedPaths[0],
+    await pushJobResult({
+      ...baseJob,
       totalFiles,
-      paths: renamedPaths,
-    })
+      progress: 100,
+      status: 'success',
+      outputPath: renamedPaths[0],
+      outputPaths: renamedPaths,
+      completedAt: new Date().toISOString(),
+    }, renamedPaths)
   }
 }
 
@@ -384,36 +520,35 @@ async function runMergePdfRename(params: {
 }) {
   const pdfFiles = await collectFilesByExtension(params.paths, ['pdf'])
   const totalFiles = pdfFiles.length
+  const baseJob = createJobRecord({
+    id: params.id,
+    name: params.name,
+    operation: params.operation,
+    createdAt: params.createdAt,
+    totalFiles,
+    inputPaths: params.paths,
+    renamePattern: params.renamePattern,
+  })
 
   if (totalFiles === 0) {
-    emitJobProgress({
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
-      totalFiles: 0,
-      progress: 100,
-      status: 'error',
-      createdAt: params.createdAt,
-    })
+    await failJobWithError(baseJob, new Error(tm('common.unknownError')))
     return
   }
 
   const mergedPdf = await PDFDocument.create()
   for (let index = 0; index < pdfFiles.length; index += 1) {
+    throwIfCancelled(params.id)
     const sourcePath = pdfFiles[index]
     const sourceBytes = await readFile(sourcePath)
     const sourcePdf = await PDFDocument.load(sourceBytes)
     const copiedPages = await mergedPdf.copyPages(sourcePdf, sourcePdf.getPageIndices())
     copiedPages.forEach((page) => mergedPdf.addPage(page))
 
-    emitJobProgress({
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
+    await pushJobProgress({
+      ...baseJob,
       totalFiles,
       progress: Math.max(5, Math.round(((index + 1) / totalFiles) * 90)),
       status: 'running',
-      createdAt: params.createdAt,
     })
   }
 
@@ -427,16 +562,24 @@ async function runMergePdfRename(params: {
   const mergedBytes = await mergedPdf.save()
   await writeFile(outputPath, mergedBytes)
 
-  emitJobProgress({
-    id: params.id,
-    name: params.name,
-    operation: params.operation,
+  await pushJobProgress({
+    ...baseJob,
     totalFiles,
     progress: 100,
     status: 'success',
-    createdAt: params.createdAt,
+    outputPath,
+    outputPaths: [outputPath],
+    completedAt: new Date().toISOString(),
   })
-  emitJobResult({ id: params.id, outputPath, totalFiles })
+  await pushJobResult({
+    ...baseJob,
+    totalFiles,
+    progress: 100,
+    status: 'success',
+    outputPath,
+    outputPaths: [outputPath],
+    completedAt: new Date().toISOString(),
+  })
 }
 
 async function runSplitPdf(params: {
@@ -448,22 +591,23 @@ async function runSplitPdf(params: {
 }) {
   const pdfFiles = await collectFilesByExtension(params.paths, ['pdf'])
   const totalFiles = pdfFiles.length
+  const baseJob = createJobRecord({
+    id: params.id,
+    name: params.name,
+    operation: params.operation,
+    createdAt: params.createdAt,
+    totalFiles,
+    inputPaths: params.paths,
+  })
 
   if (totalFiles === 0) {
-    emitJobProgress({
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
-      totalFiles: 0,
-      progress: 100,
-      status: 'error',
-      createdAt: params.createdAt,
-    })
+    await failJobWithError(baseJob, new Error(tm('common.unknownError')))
     return
   }
 
   let firstOutputPath = ''
   for (let fileIndex = 0; fileIndex < pdfFiles.length; fileIndex += 1) {
+    throwIfCancelled(params.id)
     const sourcePath = pdfFiles[fileIndex]
     const parsed = path.parse(sourcePath)
     const sourceBytes = await readFile(sourcePath)
@@ -481,18 +625,27 @@ async function runSplitPdf(params: {
       if (!firstOutputPath) firstOutputPath = outputPath
     }
 
-    emitJobProgress({
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
+    await pushJobProgress({
+      ...baseJob,
       totalFiles,
       progress: Math.round(((fileIndex + 1) / totalFiles) * 100),
       status: fileIndex + 1 === totalFiles ? 'success' : 'running',
-      createdAt: params.createdAt,
+      outputPath: firstOutputPath || null,
+      outputPaths: firstOutputPath ? [firstOutputPath] : [],
+      completedAt: fileIndex + 1 === totalFiles ? new Date().toISOString() : null,
     })
   }
 
-  emitJobResult({ id: params.id, outputPath: firstOutputPath || pdfFiles[0], totalFiles })
+  const outputPath = firstOutputPath || pdfFiles[0]
+  await pushJobResult({
+    ...baseJob,
+    totalFiles,
+    progress: 100,
+    status: 'success',
+    outputPath,
+    outputPaths: [outputPath],
+    completedAt: new Date().toISOString(),
+  })
 }
 
 async function runCsvFilterXlsxExport(params: {
@@ -504,22 +657,23 @@ async function runCsvFilterXlsxExport(params: {
 }) {
   const csvFiles = await collectFilesByExtension(params.paths, ['csv'])
   const totalFiles = csvFiles.length
+  const baseJob = createJobRecord({
+    id: params.id,
+    name: params.name,
+    operation: params.operation,
+    createdAt: params.createdAt,
+    totalFiles,
+    inputPaths: params.paths,
+  })
 
   if (totalFiles === 0) {
-    emitJobProgress({
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
-      totalFiles: 0,
-      progress: 100,
-      status: 'error',
-      createdAt: params.createdAt,
-    })
+    await failJobWithError(baseJob, new Error(tm('common.unknownError')))
     return
   }
 
   let firstOutputPath = ''
   for (let index = 0; index < csvFiles.length; index += 1) {
+    throwIfCancelled(params.id)
     const csvPath = csvFiles[index]
     const csvBytes = await readFile(csvPath)
     const workbook = XLSX.read(csvBytes, { type: 'buffer', raw: true, dense: true })
@@ -543,18 +697,27 @@ async function runCsvFilterXlsxExport(params: {
     await writeFile(outputPath, xlsxBytes)
     if (!firstOutputPath) firstOutputPath = outputPath
 
-    emitJobProgress({
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
+    await pushJobProgress({
+      ...baseJob,
       totalFiles,
       progress: Math.round(((index + 1) / totalFiles) * 100),
       status: index + 1 === totalFiles ? 'success' : 'running',
-      createdAt: params.createdAt,
+      outputPath: firstOutputPath || null,
+      outputPaths: firstOutputPath ? [firstOutputPath] : [],
+      completedAt: index + 1 === totalFiles ? new Date().toISOString() : null,
     })
   }
 
-  emitJobResult({ id: params.id, outputPath: firstOutputPath || csvFiles[0], totalFiles })
+  const outputPath = firstOutputPath || csvFiles[0]
+  await pushJobResult({
+    ...baseJob,
+    totalFiles,
+    progress: 100,
+    status: 'success',
+    outputPath,
+    outputPaths: [outputPath],
+    completedAt: new Date().toISOString(),
+  })
 }
 
 async function runImagesToPdf(params: {
@@ -571,22 +734,24 @@ async function runImagesToPdf(params: {
     return ext === 'jpg' || ext === 'jpeg' || ext === 'png' || ext === 'webp'
   })
   const totalFiles = compatibleImages.length
+  const baseJob = createJobRecord({
+    id: params.id,
+    name: params.name,
+    operation: params.operation,
+    createdAt: params.createdAt,
+    totalFiles,
+    inputPaths: params.paths,
+    renamePattern: params.renamePattern,
+  })
 
   if (totalFiles === 0) {
-    emitJobProgress({
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
-      totalFiles: 0,
-      progress: 100,
-      status: 'error',
-      createdAt: params.createdAt,
-    })
-    throw new Error(tm('organizer.errors.noCompatibleImages'))
+    await failJobWithError(baseJob, new Error(tm('organizer.errors.noCompatibleImages')))
+    return
   }
 
   const outPdf = await PDFDocument.create()
   for (let index = 0; index < compatibleImages.length; index += 1) {
+    throwIfCancelled(params.id)
     const imagePath = compatibleImages[index]
     const image = await embedImageForPdf(outPdf, imagePath)
 
@@ -598,14 +763,11 @@ async function runImagesToPdf(params: {
       height: image.height,
     })
 
-    emitJobProgress({
-      id: params.id,
-      name: params.name,
-      operation: params.operation,
+    await pushJobProgress({
+      ...baseJob,
       totalFiles,
       progress: Math.round(((index + 1) / totalFiles) * 90),
       status: 'running',
-      createdAt: params.createdAt,
     })
   }
 
@@ -619,16 +781,24 @@ async function runImagesToPdf(params: {
   const pdfBytes = await outPdf.save()
   await writeFile(outputPath, pdfBytes)
 
-  emitJobProgress({
-    id: params.id,
-    name: params.name,
-    operation: params.operation,
+  await pushJobProgress({
+    ...baseJob,
     totalFiles,
     progress: 100,
     status: 'success',
-    createdAt: params.createdAt,
+    outputPath,
+    outputPaths: [outputPath],
+    completedAt: new Date().toISOString(),
   })
-  emitJobResult({ id: params.id, outputPath, totalFiles })
+  await pushJobResult({
+    ...baseJob,
+    totalFiles,
+    progress: 100,
+    status: 'success',
+    outputPath,
+    outputPaths: [outputPath],
+    completedAt: new Date().toISOString(),
+  })
 }
 
 async function createWindow() {
@@ -669,7 +839,10 @@ async function createWindow() {
   update(win)
 }
 
-app.whenReady().then(createWindow)
+app.whenReady().then(async () => {
+  await loadAppState()
+  await createWindow()
+})
 
 app.on('window-all-closed', () => {
   for (const timer of runningJobs.values()) clearInterval(timer)
@@ -725,21 +898,23 @@ ipcMain.handle('toolkit:pick-paths', async () => {
 
 ipcMain.handle(
   'toolkit:start-job',
-  async (_, payload: { name: string; operation: string; paths: string[]; renamePattern?: string }) => {
+  async (_, payload: { name: string; operation: string; paths: string[]; renamePattern?: string; dryRun?: boolean }) => {
     const jobId = randomUUID()
     const createdAt = new Date().toISOString().slice(0, 16).replace('T', ' ')
+    jobCancellation.set(jobId, { cancelled: false })
 
-    const initialJob = {
+    const initialJob = createJobRecord({
       id: jobId,
       name: payload.name,
       operation: payload.operation,
-      totalFiles: payload.paths.length,
-      progress: 0,
-      status: 'running' as const,
       createdAt,
-    }
+      totalFiles: payload.paths.length,
+      inputPaths: payload.paths,
+      renamePattern: payload.renamePattern,
+      dryRun: payload.dryRun,
+    })
 
-    emitJobProgress(initialJob)
+    await pushJobProgress(initialJob)
 
     if (payload.operation === 'batch_rename' || payload.operation === 'Batch Rename') {
       runBatchRename({
@@ -749,15 +924,11 @@ ipcMain.handle(
         createdAt,
         paths: payload.paths,
         renamePattern: payload.renamePattern,
+        dryRun: payload.dryRun,
       }).catch((error) => {
-        failJobWithError({
-          id: jobId,
-          name: payload.name,
-          operation: payload.operation,
-          createdAt,
-          totalFiles: payload.paths.length,
-          error,
-        })
+        void failJobWithError(initialJob, error)
+      }).finally(() => {
+        jobCancellation.delete(jobId)
       })
       return initialJob
     }
@@ -771,14 +942,9 @@ ipcMain.handle(
         paths: payload.paths,
         renamePattern: payload.renamePattern,
       }).catch((error) => {
-        failJobWithError({
-          id: jobId,
-          name: payload.name,
-          operation: payload.operation,
-          createdAt,
-          totalFiles: payload.paths.length,
-          error,
-        })
+        void failJobWithError(initialJob, error)
+      }).finally(() => {
+        jobCancellation.delete(jobId)
       })
       return initialJob
     }
@@ -791,14 +957,9 @@ ipcMain.handle(
         createdAt,
         paths: payload.paths,
       }).catch((error) => {
-        failJobWithError({
-          id: jobId,
-          name: payload.name,
-          operation: payload.operation,
-          createdAt,
-          totalFiles: payload.paths.length,
-          error,
-        })
+        void failJobWithError(initialJob, error)
+      }).finally(() => {
+        jobCancellation.delete(jobId)
       })
       return initialJob
     }
@@ -811,14 +972,9 @@ ipcMain.handle(
         createdAt,
         paths: payload.paths,
       }).catch((error) => {
-        failJobWithError({
-          id: jobId,
-          name: payload.name,
-          operation: payload.operation,
-          createdAt,
-          totalFiles: payload.paths.length,
-          error,
-        })
+        void failJobWithError(initialJob, error)
+      }).finally(() => {
+        jobCancellation.delete(jobId)
       })
       return initialJob
     }
@@ -832,37 +988,49 @@ ipcMain.handle(
         paths: payload.paths,
         renamePattern: payload.renamePattern,
       }).catch((error) => {
-        failJobWithError({
-          id: jobId,
-          name: payload.name,
-          operation: payload.operation,
-          createdAt,
-          totalFiles: payload.paths.length,
-          error,
-        })
+        void failJobWithError(initialJob, error)
+      }).finally(() => {
+        jobCancellation.delete(jobId)
       })
       return initialJob
     }
 
     let progress = 0
     const timer = setInterval(() => {
+      if (jobCancellation.get(jobId)?.cancelled) {
+        clearInterval(timer)
+        runningJobs.delete(jobId)
+        jobCancellation.delete(jobId)
+        void pushJobProgress({
+          ...initialJob,
+          status: 'cancelled',
+          completedAt: new Date().toISOString(),
+        })
+        return
+      }
+
       const increment = Math.floor(Math.random() * 14) + 7
       progress = Math.min(100, progress + increment)
 
-      emitJobProgress({
+      void pushJobProgress({
         ...initialJob,
         progress,
         status: progress >= 100 ? 'success' : 'running',
+        completedAt: progress >= 100 ? new Date().toISOString() : null,
       })
 
       if (progress >= 100) {
-        emitJobResult({
-          id: jobId,
+        void pushJobResult({
+          ...initialJob,
+          progress: 100,
+          status: 'success',
           outputPath: payload.paths[0] || '',
-          totalFiles: payload.paths.length,
+          outputPaths: payload.paths[0] ? [payload.paths[0]] : [],
+          completedAt: new Date().toISOString(),
         })
         clearInterval(timer)
         runningJobs.delete(jobId)
+        jobCancellation.delete(jobId)
       }
     }, 850)
 
@@ -871,6 +1039,35 @@ ipcMain.handle(
     return initialJob
   },
 )
+
+ipcMain.handle('toolkit:cancel-job', async (_, jobId: string) => {
+  const controller = jobCancellation.get(jobId)
+  if (!controller) return false
+  controller.cancelled = true
+  return true
+})
+
+ipcMain.handle('toolkit:app-get-state', async () => {
+  await loadAppState()
+  return appStateCache
+})
+
+ipcMain.handle('toolkit:app-save-settings', async (_, settings: AppSettings) => {
+  await updateAppState({
+    settings: { ...defaultSettings, ...settings },
+  })
+  return true
+})
+
+ipcMain.handle('toolkit:app-save-jobs', async (_, jobs: JobRecord[]) => {
+  await updateAppState({ jobs })
+  return true
+})
+
+ipcMain.handle('toolkit:app-save-presets', async (_, presets: JobPreset[]) => {
+  await updateAppState({ presets })
+  return true
+})
 
 ipcMain.handle('toolkit:reveal-in-folder', (_, targetPath: string) => {
   if (!targetPath) return

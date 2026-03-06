@@ -1,6 +1,8 @@
 /// <reference types="vite/client" />
 
-import type { JobRecord } from '@/types/job'
+import type { AppStateSnapshot, JobRecord } from '@/types/job'
+import type { JobPreset } from '@/types/preset'
+import type { AppSettings } from '@/types/settings'
 
 declare global {
   interface Window {
@@ -8,7 +10,14 @@ declare global {
     ipcRenderer: import('electron').IpcRenderer
     toolkit: {
       pickPaths: () => Promise<string[]>
-      startJob: (payload: { name: string; operation: string; paths: string[]; renamePattern?: string }) => Promise<JobRecord>
+      startJob: (payload: {
+        name: string
+        operation: string
+        paths: string[]
+        renamePattern?: string
+        dryRun?: boolean
+      }) => Promise<JobRecord>
+      cancelJob: (jobId: string) => Promise<boolean>
       getPathForFile: (file: File) => string
       getImagePreview: (targetPath: string) => Promise<string | null>
       getPdfPreview: (targetPath: string) => Promise<string | null>
@@ -17,11 +26,17 @@ declare global {
       startNativeDrag: (paths: string[]) => void
       onJobProgress: (listener: (payload: JobRecord) => void) => () => void
       onJobResult: (
-        listener: (payload: { id: string; outputPath: string; totalFiles: number; paths?: string[] }) => void
+        listener: (payload: { job: JobRecord; paths?: string[] }) => void
       ) => () => void
       onJobError: (
-        listener: (payload: { id: string; operation: string; message: string; detail: string; at: string }) => void
+        listener: (payload: { job: JobRecord; message: string; detail: string; at: string }) => void
       ) => () => void
+      app: {
+        getState: () => Promise<AppStateSnapshot>
+        saveSettings: (settings: AppSettings) => Promise<boolean>
+        saveJobs: (jobs: JobRecord[]) => Promise<boolean>
+        savePresets: (presets: JobPreset[]) => Promise<boolean>
+      }
       organizer: {
         getHome: () => Promise<string>
         pickFolder: () => Promise<string | null>

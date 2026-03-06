@@ -1,17 +1,15 @@
 import { create } from 'zustand'
-import { AppSettings } from '@/types/settings'
+import { AppSettings, defaultSettings } from '@/types/settings'
 
 type SettingsState = {
   settings: AppSettings
+  setSettings: (next: AppSettings) => void
   updateSettings: (next: Partial<AppSettings>) => void
 }
 
 export const useSettingsStore = create<SettingsState>((set) => ({
-  settings: {
-    outputDirectory: '~/Documents/OfflineDocsToolkit',
-    defaultRenamePattern: '{client}_{date}_{seq}',
-    language: 'pt-BR',
-  },
+  settings: defaultSettings,
+  setSettings: (settings) => set({ settings }),
   updateSettings: (next) =>
     set((state) => ({
       settings: { ...state.settings, ...next },

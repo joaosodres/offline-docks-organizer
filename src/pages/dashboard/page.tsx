@@ -7,7 +7,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useI18n } from '@/i18n/useI18n'
 import { operationKeyFromId, operationOptions, type OperationId } from '@/lib/operations'
 import { useJobStore } from '@/stores/useJobStore'
+import { usePresetStore } from '@/stores/usePresetStore'
 import { useSelectionStore } from '@/stores/useSelectionStore'
+import { useSettingsStore } from '@/stores/useSettingsStore'
 import { useUiStore } from '@/stores/useUiStore'
 
 const imageExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'heic', 'heif'])
@@ -56,7 +58,13 @@ function normalizeDroppedPath(rawPath: string) {
 
 export function DashboardPage() {
   const [operation, setOperation] = useState<OperationId>('merge_pdf_rename')
-  const [renamePattern, setRenamePattern] = useState('{name}_{seq}')
+  const settings = useSettingsStore((state) => state.settings)
+  const presets = usePresetStore((state) => state.presets)
+  const upsertPreset = usePresetStore((state) => state.upsertPreset)
+  const removePreset = usePresetStore((state) => state.removePreset)
+  const [renamePattern, setRenamePattern] = useState(settings.defaultRenamePattern)
+  const [presetId, setPresetId] = useState('none')
+  const [presetName, setPresetName] = useState('')
   const [isPicking, setIsPicking] = useState(false)
   const [isStarting, setIsStarting] = useState(false)
   const [isDragActive, setIsDragActive] = useState(false)
@@ -86,6 +94,10 @@ export function DashboardPage() {
   useEffect(() => {
     selectedPathsRef.current = selectedPaths
   }, [selectedPaths])
+
+  useEffect(() => {
+    setRenamePattern((current) => current || settings.defaultRenamePattern)
+  }, [settings.defaultRenamePattern])
 
   useEffect(() => {
     if (!toolkit?.getImagePreview) return
@@ -191,7 +203,7 @@ export function DashboardPage() {
     }
   }
 
-  const startJob = async () => {
+  const startJob = async (dryRun = false) => {
     if (!selectedPaths.length) return
 
     setIsStarting(true)
@@ -202,12 +214,39 @@ export function DashboardPage() {
         operation,
         paths: selectedPaths,
         renamePattern,
+        dryRun,
       })
       if (!job) return
       upsertJob(job)
     } finally {
       setIsStarting(false)
     }
+  }
+
+  const savePreset = () => {
+    const name = presetName.trim()
+    if (!name) return
+
+    const nextId = presetId !== 'none' ? presetId : crypto.randomUUID()
+    upsertPreset({
+      id: nextId,
+      name,
+      operation,
+      renamePattern,
+    })
+    setPresetId(nextId)
+    setPresetName('')
+  }
+
+  const applyPreset = (nextPresetId: string) => {
+    setPresetId(nextPresetId)
+    if (nextPresetId === 'none') return
+
+    const preset = presets.find((item) => item.id === nextPresetId)
+    if (!preset) return
+    setOperation(preset.operation as OperationId)
+    setRenamePattern(preset.renamePattern)
+    setPresetName(preset.name)
   }
 
   const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
@@ -284,12 +323,13 @@ export function DashboardPage() {
     <motion.div 
       initial={{ opacity: 0, scale: 0.98 }}
       animate={{ opacity: 1, scale: 1 }}
-      className='mx-auto max-w-6xl space-y-6'
+      className='h-full overflow-y-auto overflow-x-hidden'
     >
-      <header className='mb-8 space-y-2'>
-        <h2 className='text-3xl font-bold tracking-tight text-white'>{t('dashboard.title')}</h2>
-        <p className='text-base text-[var(--muted)]'>{t('dashboard.subtitle')}</p>
-      </header>
+      <div className='mx-auto max-w-6xl space-y-6 px-6 py-8'>
+        <header className='mb-8 space-y-2'>
+          <h2 className='text-3xl font-bold tracking-tight text-white'>{t('dashboard.title')}</h2>
+          <p className='text-base text-[var(--muted)]'>{t('dashboard.subtitle')}</p>
+        </header>
 
       <div className='grid gap-6 lg:grid-cols-3'>
         <div className='lg:col-span-2 space-y-6'>
@@ -375,9 +415,66 @@ export function DashboardPage() {
                 </div>
               )}
             </div>
-            
-            <div className='flex justify-end pt-2 border-t border-white/5 mt-6'>
-              <Button onClick={startJob} disabled={!canStart} className='px-8 mt-6'>
+
+            <div className='grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]'>
+              <div className='space-y-2'>
+                <label className='text-sm font-medium text-[var(--muted)]'>Preset</label>
+                <Select value={presetId} onValueChange={applyPreset}>
+                  <SelectTrigger>
+                    <SelectValue placeholder='Select preset' />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value='none'>No preset</SelectItem>
+                    {presets.map((preset) => (
+                      <SelectItem key={preset.id} value={preset.id}>
+                        {preset.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className='space-y-2'>
+                <label htmlFor='presetName' className='text-sm font-medium text-[var(--muted)]'>
+                  Preset name
+                </label>
+                <input
+                  id='presetName'
+                  value={presetName}
+                  onChange={(event) => setPresetName(event.target.value)}
+                  className='w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-sm text-white placeholder-white/20 focus:border-cyan-400 focus:outline-none focus:ring-1 focus:ring-cyan-400 transition-colors'
+                  placeholder='Monthly receipts'
+                />
+              </div>
+
+              <div className='flex items-end gap-2'>
+                <Button variant='secondary' onClick={savePreset} disabled={!presetName.trim()}>
+                  Save
+                </Button>
+                {presetId !== 'none' && (
+                  <Button
+                    variant='ghost'
+                    onClick={() => {
+                      removePreset(presetId)
+                      setPresetId('none')
+                    }}
+                  >
+                    Delete
+                  </Button>
+                )}
+              </div>
+            </div>
+
+            <div className='flex flex-wrap justify-end gap-3 pt-2 border-t border-white/5 mt-6'>
+              <Button
+                variant='secondary'
+                onClick={() => startJob(true)}
+                disabled={!canStart || operation !== 'batch_rename'}
+                className='px-6 mt-6'
+              >
+                Dry run
+              </Button>
+              <Button onClick={() => startJob(false)} disabled={!canStart} className='px-8 mt-6'>
                 {isStarting ? t('dashboard.starting') : t('dashboard.startButton')}
               </Button>
             </div>
@@ -601,6 +698,7 @@ export function DashboardPage() {
           </motion.div>
         )}
       </AnimatePresence>
+      </div>
     </motion.div>
   )
 }

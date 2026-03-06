@@ -877,7 +877,7 @@ export function OrganizerPage() {
     <motion.div 
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
-      className='flex h-full w-full bg-[#09090b]'
+      className='flex h-full min-h-0 w-full overflow-hidden bg-[#09090b]'
     >
       {/* Sidebar: File Explorer */}
       <div
@@ -956,7 +956,7 @@ export function OrganizerPage() {
       </div>
 
       {/* Main Content Area */}
-      <div className='flex-1 flex flex-col min-w-0 bg-[#09090b] relative'>
+      <div className='relative flex min-w-0 flex-1 flex-col overflow-hidden bg-[#09090b]'>
         
         {/* Top Bar */}
         <header className='h-14 flex-shrink-0 flex items-center px-6 border-b border-[#27272a] bg-[#09090b]/80 backdrop-blur-sm z-10 sticky top-0'>
@@ -1009,7 +1009,14 @@ export function OrganizerPage() {
                       onChange={(event) => setRenamePattern(event.target.value)}
                       placeholder='{name}_{seq}'
                     />
-                    <p className='text-[10px] text-zinc-500'>{t('dashboard.tokens')} <code className='ml-1 rounded bg-blue-500/10 px-1 py-0.5 text-blue-400'>{"{name}"}</code> <code className='rounded bg-blue-500/10 px-1 py-0.5 text-blue-400'>{"{seq}"}</code> <code className='rounded bg-blue-500/10 px-1 py-0.5 text-blue-400'>{"{date}"}</code></p>
+                    <div className='space-y-1.5 text-[10px] text-zinc-500'>
+                      <p>{t('dashboard.tokens')} <code className='ml-1 rounded bg-blue-500/10 px-1 py-0.5 text-blue-400'>{"{name}"}</code> <code className='rounded bg-blue-500/10 px-1 py-0.5 text-blue-400'>{"{seq}"}</code> <code className='rounded bg-blue-500/10 px-1 py-0.5 text-blue-400'>{"{date}"}</code></p>
+                      <p>{t('dashboard.tokenExamples')}</p>
+                      <p>{t('dashboard.tokenExampleName')}</p>
+                      <p>{t('dashboard.tokenExampleSeq')}</p>
+                      <p>{t('dashboard.tokenExampleDate')}</p>
+                      <p className='text-zinc-400'>{t('dashboard.tokenExamplePattern')}</p>
+                    </div>
                   </div>
                 )}
               </div>

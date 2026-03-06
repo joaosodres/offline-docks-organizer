@@ -15,7 +15,7 @@ export function SidebarNav() {
   const location = useLocation()
 
   return (
-    <aside className='w-[240px] flex-shrink-0 flex flex-col bg-[#111113] border-r border-[#27272a] text-zinc-300'>
+    <aside className='flex h-full w-[240px] flex-shrink-0 flex-col bg-[#111113] border-r border-[#27272a] text-zinc-300'>
       <div className='p-3 m-3 hover:bg-[#27272a]/60 transition-colors cursor-pointer rounded-lg flex items-center gap-3 select-none'>
         <div className='h-8 w-8 rounded-md bg-zinc-100 text-zinc-950 flex shadow-sm items-center justify-center'>
           <Command size={16} strokeWidth={2.5} />

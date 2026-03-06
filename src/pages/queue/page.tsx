@@ -1,81 +1,69 @@
-import { useMemo } from 'react'
-import { ColumnDef, flexRender, getCoreRowModel, useReactTable } from '@tanstack/react-table'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Progress } from '@/components/ui/progress'
 import { useI18n } from '@/i18n/useI18n'
 import { operationKeyFromId } from '@/lib/operations'
-import { Progress } from '@/components/ui/progress'
 import { useJobStore } from '@/stores/useJobStore'
-import { JobRecord } from '@/types/job'
 
 export function QueuePage() {
   const { t } = useI18n()
   const jobs = useJobStore((state) => state.jobs)
-  const data = useMemo(() => jobs, [jobs])
-  const columns = useMemo<ColumnDef<JobRecord>[]>(() => [
-    { header: t('queue.headers.job'), accessorKey: 'name' },
-    {
-      header: t('queue.headers.operation'),
-      accessorKey: 'operation',
-      cell: ({ row }) => t(operationKeyFromId(row.original.operation)),
-    },
-    { header: t('queue.headers.files'), accessorKey: 'totalFiles' },
-    {
-      header: t('queue.headers.status'),
-      accessorKey: 'status',
-      cell: ({ row }) => {
-        const status = row.original.status
-        const tone = status === 'success' ? 'success' : status === 'error' ? 'error' : status === 'running' ? 'running' : 'neutral'
-        return <Badge tone={tone}>{t(`status.${status}`)}</Badge>
-      },
-    },
-    {
-      header: t('queue.headers.progress'),
-      accessorKey: 'progress',
-      cell: ({ row }) => <Progress value={row.original.progress} />,
-    },
-    { header: t('queue.headers.created'), accessorKey: 'createdAt' },
-  ], [t])
-
-  const table = useReactTable({
-    data,
-    columns,
-    getCoreRowModel: getCoreRowModel(),
-  })
+  const queueJobs = jobs.filter((job) => job.status === 'running' || job.status === 'idle').sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 
   return (
-    <div className='space-y-4'>
-      <header>
-        <h2 className='text-2xl font-semibold'>{t('queue.title')}</h2>
-        <p className='text-sm text-[var(--muted)]'>{t('queue.subtitle')}</p>
-      </header>
+    <div className='h-full overflow-y-auto p-6'>
+      <div className='space-y-4'>
+        <header>
+          <h2 className='text-2xl font-semibold'>{t('queue.title')}</h2>
+          <p className='text-sm text-[var(--muted)]'>{t('queue.subtitle')}</p>
+        </header>
 
-      <Card className='overflow-hidden p-0'>
-        <table className='w-full border-collapse text-sm'>
-          <thead className='bg-[var(--surface-2)]'>
-            {table.getHeaderGroups().map((headerGroup) => (
-              <tr key={headerGroup.id}>
-                {headerGroup.headers.map((header) => (
-                  <th key={header.id} className='px-3 py-2 text-left font-medium'>
-                    {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
-                  </th>
-                ))}
-              </tr>
-            ))}
-          </thead>
-          <tbody>
-            {table.getRowModel().rows.map((row) => (
-              <tr key={row.id} className='border-t border-[var(--border)]'>
-                {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id} className='px-3 py-2'>
-                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </Card>
+      <div className='grid gap-3'>
+        {queueJobs.length === 0 && <Card>{t('queue.empty')}</Card>}
+        {queueJobs.map((job) => {
+          const tone = job.status === 'success'
+            ? 'success'
+            : job.status === 'error'
+              ? 'error'
+              : job.status === 'cancelled'
+                ? 'neutral'
+                : 'running'
+
+          return (
+            <Card key={job.id} className='space-y-4'>
+              <div className='flex flex-wrap items-start justify-between gap-3'>
+                <div className='space-y-1'>
+                  <p className='font-medium'>{job.name}</p>
+                  <p className='text-sm text-[var(--muted)]'>{t(operationKeyFromId(job.operation))}</p>
+                  <p className='text-xs text-[var(--muted)]'>{job.createdAt}</p>
+                </div>
+                <Badge tone={tone}>{t(`status.${job.status}`)}</Badge>
+              </div>
+
+              <div className='space-y-2'>
+                <div className='flex items-center justify-between text-xs text-[var(--muted)]'>
+                  <span>{t('queue.filesCount').replace('{count}', String(job.totalFiles))}</span>
+                  <span>{job.progress}%</span>
+                </div>
+                <Progress value={job.progress} />
+              </div>
+
+              <div className='flex flex-wrap gap-2'>
+                <Button variant='secondary' onClick={() => void window.toolkit.cancelJob(job.id)}>
+                  {t('queue.cancel')}
+                </Button>
+                {job.outputPath && (
+                  <Button variant='ghost' onClick={() => void window.toolkit.revealInFolder(job.outputPath!)}>
+                    {t('queue.showOutput')}
+                  </Button>
+                )}
+              </div>
+            </Card>
+          )
+        })}
+      </div>
+    </div>
     </div>
   )
 }

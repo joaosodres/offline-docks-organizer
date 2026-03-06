@@ -23,7 +23,7 @@ export function AppLayout() {
           </motion.div>
         )}
       </AnimatePresence>
-      <main className='flex-1 relative flex flex-col min-w-0'>
+      <main className='relative flex min-w-0 flex-1 flex-col overflow-hidden'>
         <AnimatePresence mode='wait'>
           <motion.div
             key={location.pathname}
@@ -31,7 +31,7 @@ export function AppLayout() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.98 }}
             transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-            className='h-full flex flex-col flex-1 min-h-0'
+            className='flex h-full min-h-0 flex-1 flex-col overflow-hidden'
           >
             <Outlet />
           </motion.div>

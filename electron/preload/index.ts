@@ -1,4 +1,5 @@
 import { ipcRenderer, contextBridge, webUtils } from 'electron'
+import type { JobRecord } from '../../src/types/job'
 
 // --------- Expose some API to the Renderer process ---------
 contextBridge.exposeInMainWorld('ipcRenderer', {
@@ -25,8 +26,9 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
 
 contextBridge.exposeInMainWorld('toolkit', {
   pickPaths: () => ipcRenderer.invoke('toolkit:pick-paths'),
-  startJob: (payload: { name: string; operation: string; paths: string[]; renamePattern?: string }) =>
+  startJob: (payload: { name: string; operation: string; paths: string[]; renamePattern?: string; dryRun?: boolean }) =>
     ipcRenderer.invoke('toolkit:start-job', payload),
+  cancelJob: (jobId: string) => ipcRenderer.invoke('toolkit:cancel-job', jobId),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   getImagePreview: (targetPath: string) => ipcRenderer.invoke('toolkit:get-image-preview', targetPath),
   getPdfPreview: (targetPath: string) => ipcRenderer.invoke('toolkit:get-pdf-preview', targetPath),
@@ -58,11 +60,11 @@ contextBridge.exposeInMainWorld('toolkit', {
     return () => ipcRenderer.off('toolkit:job-progress', wrappedListener)
   },
   onJobResult: (
-    listener: (payload: { id: string; outputPath: string; totalFiles: number; paths?: string[] }) => void,
+    listener: (payload: { job: JobRecord; paths?: string[] }) => void,
   ) => {
     const wrappedListener = (
       _event: unknown,
-      payload: { id: string; outputPath: string; totalFiles: number; paths?: string[] },
+      payload: { job: JobRecord; paths?: string[] },
     ) =>
       listener(payload)
 
@@ -70,15 +72,21 @@ contextBridge.exposeInMainWorld('toolkit', {
     return () => ipcRenderer.off('toolkit:job-result', wrappedListener)
   },
   onJobError: (
-    listener: (payload: { id: string; operation: string; message: string; detail: string; at: string }) => void,
+    listener: (payload: { job: JobRecord; message: string; detail: string; at: string }) => void,
   ) => {
     const wrappedListener = (
       _event: unknown,
-      payload: { id: string; operation: string; message: string; detail: string; at: string },
+      payload: { job: JobRecord; message: string; detail: string; at: string },
     ) => listener(payload)
 
     ipcRenderer.on('toolkit:job-error', wrappedListener)
     return () => ipcRenderer.off('toolkit:job-error', wrappedListener)
+  },
+  app: {
+    getState: () => ipcRenderer.invoke('toolkit:app-get-state'),
+    saveSettings: (settings: unknown) => ipcRenderer.invoke('toolkit:app-save-settings', settings),
+    saveJobs: (jobs: unknown) => ipcRenderer.invoke('toolkit:app-save-jobs', jobs),
+    savePresets: (presets: unknown) => ipcRenderer.invoke('toolkit:app-save-presets', presets),
   },
   organizer: {
     getHome: () => ipcRenderer.invoke('toolkit:organizer-get-home'),
