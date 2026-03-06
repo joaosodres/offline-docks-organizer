@@ -1,6 +1,6 @@
 {
   "name": "offline-docs-toolkit",
-  "version": "0.1.0",
+  "version": "0.1.0-beta",
   "main": "dist-electron/main/index.js",
   "description": "Offline desktop batch toolkit for PDF, CSV and spreadsheets.",
   "author": "joao",
